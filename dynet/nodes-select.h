@@ -12,6 +12,7 @@ struct SelectRows : public Node {
   explicit SelectRows(const std::initializer_list<VariableIndex>& a, const std::vector<unsigned>& r) : Node(a), rows(r), prows(&rows) {}
   explicit SelectRows(const std::initializer_list<VariableIndex>& a, const std::vector<unsigned>* pr) : Node(a), prows(pr) {}
   DYNET_NODE_DEFINE_DEV_IMPL()
+  virtual bool supports_multibatch() const override { return true; }
   std::vector<unsigned> rows;
   const std::vector<unsigned>* prows;
 };
@@ -22,6 +23,7 @@ struct SelectCols : public Node {
   explicit SelectCols(const std::initializer_list<VariableIndex>& a, const std::vector<unsigned>& c) : Node(a), cols(c), pcols(&cols) {}
   explicit SelectCols(const std::initializer_list<VariableIndex>& a, const std::vector<unsigned>* pc) : Node(a), pcols(pc) {}
   DYNET_NODE_DEFINE_DEV_IMPL()
+  virtual bool supports_multibatch() const override { return true; }
   std::vector<unsigned> cols;
   const std::vector<unsigned>* pcols;
 };
@@ -82,7 +84,13 @@ struct PickBatchElements : public Node {
 // y = (x)_{[*pval]}
 struct StridedSelect : public Node {
   explicit StridedSelect(const std::initializer_list<VariableIndex>& a, const std::vector<int>& strides,
-                         const std::vector<int>& from, const std::vector<int>& to) : Node(a), strides(strides), from(from), to(to) {}
+                         const std::vector<int>& from, const std::vector<int>& to, bool inplaced=false)
+                        : Node(a), strides(strides), from(from), to(to) {
+    if(inplaced){
+      forward_inplace_state = INPLACE_TYPE::READ;
+      backward_inplace_state = INPLACE_TYPE::WRITE;
+    }
+  }
   DYNET_NODE_DEFINE_DEV_IMPL()
   virtual bool supports_multibatch() const override { return true; }
   const std::vector<int> strides, from, to;

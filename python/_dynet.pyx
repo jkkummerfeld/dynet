@@ -519,6 +519,8 @@ cdef class GlorotInitializer(PyInitializer):
     
     If the dimensions of the parameter matrix are :math:`m,n`, the weights are sampled from :math:`\mathcal U([-g\sqrt{\\frac{6}{m+n}},g\sqrt{\\frac{6}{m+n}}])`
     
+    In the case of 4d tensors (common in convolutional networks) of shape :math:`XH,XW,XC,N` the weights are sampled from :math:`\mathcal U([-g\sqrt{\\frac{6}{d}},g\sqrt{\\frac{6}{d}}])` where :math:`d = XC * (XH * XW) + N * (XH * XW)`
+
     The gain :math:`g` depends on the activation function : 
 
     * :math:`\\text{tanh}` : 1.0
@@ -654,7 +656,7 @@ cdef class Expression: #{{{
             IndexError: If the indices are too large
             ValueError: In case of improper slice or if step is used
         """
-        assert isinstance(index, (int, slice)), "Expression key must be int or slice: %s" % index
+        assert isinstance(index, (int, slice, tuple)), "Expression key must be int or slice or tuple of slices: %s" % index
         cdef int rows = self.c().dim().rows()
         cdef int i, j
         if isinstance(index, int):
@@ -666,30 +668,34 @@ cdef class Expression: #{{{
             if i < 0:
                 i += rows
             return pick(self, i)
-        else:
-            i = 0
-            j = rows
-            if index.start is not None:
-                i = index.start
-                if i > rows - 1:
-                    raise IndexError("Start index too large: %d > %d" % (i, rows - 1))
-                if i < -rows:
-                    raise IndexError("Start index too small: %d < %d" % (i, -rows))
-                if i < 0:
-                    i += rows
-            if index.stop is not None:
-                j = index.stop
-                if j > rows:
-                    raise IndexError("Stop index too large: %d > %d" % (j, rows))
-                if j < -rows + 1:
-                    raise IndexError("Stop index too small: %d < %d" % (j, -rows + 1))
-                if j < 0:
-                    j += rows
-            if i >= j:
-                raise ValueError("Improper slice: start index must come strictly before stop index")
-            if index.step is not None:
-                raise ValueError("Step sizes not yet supported.")
-            return pick_range(self, i, j)
+        elif isinstance(index, slice):
+            return strided_select(self, [index.step] if index.step is not None else [], 
+                                        [index.start] if index.start is not None else [],
+                                        [index.stop] if index.stop is not None else [])
+        elif isinstance(index, tuple):
+            steps = []
+            for slice_i in index:
+              if slice_i.step is None:
+                steps.append(1)
+              else:
+                if slice_i.step <= 0: raise IndexError("steps must be positive, got:", slice_i.step)
+                steps.append(slice_i.step)
+            starts = []
+            for slice_i in index:
+              if slice_i.start is None:
+                starts.append(0)
+              else:
+                starts.append(slice_i.start)
+            stops = []
+            for i, slice_i in enumerate(index):
+              if slice_i.stop is None:
+                if i == len(self.dim()[0]):
+                  stops.append(self.dim()[1])
+                else:
+                  stops.append(self.dim()[0][i])
+              else:
+                stops.append(slice_i.stop)
+            return strided_select(self, steps, starts, stops)
 
     cpdef scalar_value(self, bool recalculate=False):
         """Returns value of an expression as a scalar
@@ -894,6 +900,7 @@ cdef class Parameters(Expression): # {{{
     cdef Expression _const_expr
     def __cinit__(self):
         self._version = -1
+        self._const_version = -1
 
     # All creations MUST go through wrap_ptr
     @staticmethod
@@ -1864,6 +1871,8 @@ def renew_cg(immediate_compute=False, check_validity=False, autobatching=None):
     return _cg.renew(immediate_compute, check_validity, autobatching)
 
 def print_text_graphviz(): return _cg.print_graphviz()
+def dump_cg(filename="", show_values=True, show_gradients=True, nan_check_only=False): return _cg.dump(filename.encode('utf-8'), show_values, show_gradients, nan_check_only)
+
 def cg_checkpoint(): 
     """
     Saves the state of the computation graph
@@ -1948,6 +1957,9 @@ cdef class ComputationGraph:
 
     cpdef print_graphviz(self):
         self.thisptr.print_graphviz()
+
+    cpdef dump(self, filename, show_values, show_gradients, nan_check_only):
+        self.thisptr.dump(filename, show_values, show_gradients, nan_check_only)
 
     cpdef void checkpoint(self):
         self.thisptr.checkpoint()
@@ -2126,10 +2138,10 @@ cdef class Tensor: #{{{
 #{{{ Expressions
 cdef ensure_freshness(Expression a):
     if a.cg_version != _cg.version():
-        if type(a) is Parameters:
+        if type(a) is Parameters or type(a) is LookupParameters:
             pass
         else:
-            raise ValueError("Attempt to use a stale expression.")
+            raise ValueError("Attempt to use a stale expression of type {}".format(type(a)))
 
 cdef _add(Expression a, Expression b): ensure_freshness(b); return Expression.from_cexpr(a.cg_version, c_op_add(a.c(), b.c()))
 cdef _mul(Expression a, Expression b): ensure_freshness(b); return Expression.from_cexpr(a.cg_version, c_op_mul(a.c(), b.c()))
@@ -2901,9 +2913,9 @@ cpdef Expression argmax(Expression x, str gradient_mode):
         dynet.Expression: The one hot argmax vector
     """
     if gradient_mode == "zero_gradient":
-        return Expression.from_cexpr(x.cg_version, c_argmax(x.c(), c_ArgmaxGradient.zero_gradient))
+        return Expression.from_cexpr(x.cg_version, c_argmax(x.c(), c_GradientMode.zero_gradient))
     elif gradient_mode == "straight_through_gradient":
-        return Expression.from_cexpr(x.cg_version, c_argmax(x.c(), c_ArgmaxGradient.straight_through_gradient))
+        return Expression.from_cexpr(x.cg_version, c_argmax(x.c(), c_GradientMode.straight_through_gradient))
     else:
         raise ValueError("Unknown gradient mode for argmax: " + gradient_mode)
 
@@ -3095,7 +3107,7 @@ cpdef Expression l1_distance(Expression x, Expression y):
 cpdef Expression binary_log_loss(Expression x, Expression y):
     """Binary log loss
     
-    The log loss of a binary decision according to the sigmoid sigmoid function :math:`- \sum_i (y_i  \ln(x_i) + (1-y_i)  \ln(1-x_i))`
+    The log loss of a binary decision according to the sigmoid function :math:`- \sum_i (y_i  \ln(x_i) + (1-y_i)  \ln(1-x_i))`
     
     Args:
         x (dynet.Expression): The first input expression
@@ -3215,7 +3227,7 @@ cpdef Expression conv2d_bias(Expression x, Expression f, Expression b, vector[un
     Args:
         x (dynet.Expression): The input feature maps: (H x W x Ci) x N (ColMaj), 3D tensor with an optional batch dimension
         f (dynet.Expression): 2D convolution filters: H x W x Ci x Co (ColMaj), 4D tensor
-        b (dynet.Expression): The bias (1D: Ci)
+        b (dynet.Expression): The bias (1D: Co)
         stride (list): the row and column strides
     
     Keyword Arguments:
@@ -3481,14 +3493,14 @@ cpdef Expression log(Expression x):
 cpdef Expression log_sigmoid(Expression x): 
     """Log sigmoid
     
-    Calculate elementwise log sigmoid function :math:`y_i = \ln(\\frac{1}{1+e^{x_i}})`
+    Calculate elementwise log sigmoid function :math:`y_i = \ln(\\frac{1}{1+e^{-x_i}})`
     This is more numerically stable than `log(logistic(x))`
     
     Args:
         x (dynet.Expression): Input expression
     
     Returns:
-        dynet.Expression: :math:`y_i = \ln(\\frac{1}{1+e^{x_i}})`
+        dynet.Expression: :math:`y_i = \ln(\\frac{1}{1+e^{-x_i}})`
     """
     return Expression.from_cexpr(x.cg_version, c_log_sigmoid(x.c()))
 cpdef Expression lgamma(Expression x): 
@@ -3597,6 +3609,66 @@ cpdef Expression silu(Expression x, float beta=1.0):
     """
     return Expression.from_cexpr(x.cg_version, c_silu(x.c(), beta))
 
+cpdef Expression round(Expression x, str gradient_mode):
+    """Rounding
+    
+    This node takes an input vector :math:`x` and returns a vector where each element is rounded to the nearest integer.
+    The gradient_mode is either :code:`"zero_gradient"` or :code:`"straight_through_gradient"` (see "argmax" for more details)
+    
+    Args:
+        x (dynet.Expression): The input vector (can be batched)
+        gradient_mode (str): Gradient mode for the backward pass (one of :code:`"zero_gradient"` or :code:`"straight_through_gradient"`
+    
+    Returns:
+        dynet.Expression: The rounded vector
+    """
+    if gradient_mode == "zero_gradient":
+        return Expression.from_cexpr(x.cg_version, c_round(x.c(), c_GradientMode.zero_gradient))
+    elif gradient_mode == "straight_through_gradient":
+        return Expression.from_cexpr(x.cg_version, c_round(x.c(), c_GradientMode.straight_through_gradient))
+    else:
+        raise ValueError("Unknown gradient mode for round: " + gradient_mode)
+
+cpdef Expression ceil(Expression x, str gradient_mode):
+    """Ceiling
+    
+    This node takes an input vector :math:`x` and returns a vector where each element is rounded to the nearest integer greater than or equal to the input.
+    The gradient_mode is either :code:`"zero_gradient"` or :code:`"straight_through_gradient"` (see "argmax" for more details)
+    
+    Args:
+        x (dynet.Expression): The input vector (can be batched)
+        gradient_mode (str): Gradient mode for the backward pass (one of :code:`"zero_gradient"` or :code:`"straight_through_gradient"`
+    
+    Returns:
+        dynet.Expression: The ceiled vector
+    """
+    if gradient_mode == "zero_gradient":
+        return Expression.from_cexpr(x.cg_version, c_ceil(x.c(), c_GradientMode.zero_gradient))
+    elif gradient_mode == "straight_through_gradient":
+        return Expression.from_cexpr(x.cg_version, c_ceil(x.c(), c_GradientMode.straight_through_gradient))
+    else:
+        raise ValueError("Unknown gradient mode for ceil: " + gradient_mode)
+
+cpdef Expression floor(Expression x, str gradient_mode):
+    """Floor
+    
+    This node takes an input vector :math:`x` and returns a vector where each element is rounded to the nearest integer less than or equal to the input.
+    The gradient_mode is either :code:`"zero_gradient"` or :code:`"straight_through_gradient"` (see "argmax" for more details)
+    
+    Args:
+        x (dynet.Expression): The input vector (can be batched)
+        gradient_mode (str): Gradient mode for the backward pass (one of :code:`"zero_gradient"` or :code:`"straight_through_gradient"`
+    
+    Returns:
+        dynet.Expression: The floored vector
+    """
+    if gradient_mode == "zero_gradient":
+        return Expression.from_cexpr(x.cg_version, c_floor(x.c(), c_GradientMode.zero_gradient))
+    elif gradient_mode == "straight_through_gradient":
+        return Expression.from_cexpr(x.cg_version, c_floor(x.c(), c_GradientMode.straight_through_gradient))
+    else:
+        raise ValueError("Unknown gradient mode for floor: " + gradient_mode)
+
 cpdef Expression log_softmax(Expression x, list restrict=None):
     """Restricted log softmax
     
@@ -3619,7 +3691,7 @@ cpdef Expression log_softmax(Expression x, list restrict=None):
 cpdef Expression softmax(Expression x, unsigned d=0):
     """Softmax
     
-    The softmax function normalizes each column to ensure that all values are between 0 and 1 and add to one by applying the :math:`\\frac{e^{x_i}}{sum_j e^{x_j}}`.
+   The softmax function normalizes each column to ensure that all values are between 0 and 1 and add to one by applying :math:`\\frac{e^{x_i}}{\sum_j e^{x_j}}`.
     
     Args:
         x (dynet.Expression): Input expression
@@ -4986,7 +5058,7 @@ cdef class SimpleRNNBuilder(_RNNBuilder): # {{{
     .. math::
 
         \\begin{split}
-            h_t & =\tanh(W_{x}x_t+W_{h}h_{t-1}+b)\\\\
+            h_t & = \\tanh(W_{x}x_t+W_{h}h_{t-1}+b)\\\\
         \end{split}
 
     Args:
@@ -5251,6 +5323,11 @@ cdef class VanillaLSTMBuilder(_RNNBuilder): # {{{
             h_t & = \\tanh(c_t)\circ o_t\\\\
         \end{split}
 
+    The parameters are initialized as follow:
+    - :math:`W_{*x}` (input connections): Sampled from :math:`\mathcal U\left([\sqrt{\\frac{6}{4d_h + d_x}}]\\right)`
+    - :math:`W_{*h}` (recurrent connections): Sampled from :math:`\mathcal U\left([\sqrt{\frac{6}{4d_h + d_h}}]\right)`
+    - :math:`b_{h}` (biases): Set to :math:`0` except for :math:`d_f` which is set to :math:`1`
+
     Args:
         layers (int): Number of layers
         input_dim (int): Dimension of the input
@@ -5353,6 +5430,167 @@ cdef class VanillaLSTMBuilder(_RNNBuilder): # {{{
             exprs.append(layer_exprs)
         return exprs
 
+    cpdef void set_dropouts(self, float d, float d_r):
+        """Set the dropout rates
+        
+        The dropout implemented here is the variational dropout with tied weights introduced in `Gal, 2016 <http://papers.nips.cc/paper/6241-a-theoretically-grounded-application-of-dropout-in-recurrent-neural-networks>`_
+
+        More specifically, dropout masks :math:`\mathbf{z_x}\sim \\text(1-d_x)`, :math:`\mathbf{z_h}\sim \\text{Bernoulli}(1-d_h)` are sampled at the start of each sequence.
+
+        The dynamics of the cell are then modified to :
+
+        .. math::
+
+            \\begin{split}
+                i_t & =\sigma(W_{ix}(\\frac 1 {1-d_x}\mathbf{z_x} \circ x_t)+W_{ih}(\\frac 1 {1-d_h}\mathbf{z_h} \circ h_{t-1})+b_i)\\\\
+                f_t & = \sigma(W_{fx}(\\frac 1 {1-d_x}\mathbf{z_x} \circ x_t)+W_{fh}(\\frac 1 {1-d_h}\mathbf{z_h} \circ h_{t-1})+b_f)\\\\
+                o_t & = \sigma(W_{ox}(\\frac 1 {1-d_x}\mathbf{z_x} \circ x_t)+W_{oh}(\\frac 1 {1-d_h}\mathbf{z_h} \circ h_{t-1})+b_o)\\\\
+                \\tilde{c_t} & = \\tanh(W_{cx}(\\frac 1 {1-d_x}\mathbf{z_x} \circ x_t)+W_{ch}(\\frac 1 {1-d_h}\mathbf{z_h} \circ h_{t-1})+b_c)\\\\
+                c_t & = c_{t-1}\circ f_t + \\tilde{c_t}\circ i_t\\\\
+                h_t & = \\tanh(c_t)\circ o_t\\\\
+            \end{split}
+
+        For more detail as to why scaling is applied, see the "Unorthodox" section of the documentation
+
+        Args:
+            d (number): Dropout rate :math:`d_x` for the input :math:`x_t`
+            d_r (number): Dropout rate :math:`d_x` for the output :math:`h_t`
+        """
+        self.thisvanillaptr.set_dropout(d, d_r)
+
+    cpdef void set_dropout_masks(self, unsigned batch_size=1):
+        """Set dropout masks at the beginning of a sequence for a specific batch size
+        
+        If this function is not called on batched input, the same mask will be applied across all batch elements. Use this to apply different masks to each batch element
+
+        You need to call this __AFTER__ calling `initial_state`
+        
+        Args:
+            batch_size (int): Batch size (default: {1})
+        """
+        self.thisvanillaptr.set_dropout_masks(batch_size)
+
+    def whoami(self): return "VanillaLSTMBuilder"
+# VanillaLSTMBuilder }}}
+
+cdef class SparseLSTMBuilder(_RNNBuilder): # {{{
+    """VanillaLSTM allows to create an "standard" LSTM, ie with decoupled input and forget gate and no peepholes connections
+    
+    During training the sparsity of the LSTM has to be increased incrementally. 
+    Sparsity is controlled using the set_sparsity method. This works by sorting all the weights based on their magnitude and applying mask on the top x-percent weight with the lowest magnitude.
+    More details on the process can be found in `Narang et al., 2017 <https://arxiv.org/pdf/1704.05119.pdf>`. The rest of the implementation is identical to VanillaLSTM
+    DISCLAIMER: This is an experimental/untested module.
+
+    Args:
+        layers (int): Number of layers
+        input_dim (int): Dimension of the input
+        hidden_dim (int): Dimension of the recurrent units
+        model (dynet.ParameterCollection): ParameterCollection to hold the parameters
+        ln_lstm (bool): Whether to use layer normalization
+        forget_bias (float): value to use as forget gate bias(default 1.0)
+    """
+    cdef CSparseLSTMBuilder* thissparsevanillaptr
+    cdef tuple _spec
+    def __init__(self, unsigned layers, unsigned input_dim, unsigned hidden_dim, ParameterCollection model, ln_lstm=False, forget_bias=1.0):
+        self._spec = (layers, input_dim, hidden_dim, ln_lstm, forget_bias)
+        if layers > 0:
+            self.thissparsevanillaptr = self.thisptr = new CSparseLSTMBuilder(layers, input_dim, hidden_dim, model.thisptr, ln_lstm, forget_bias)
+        else:
+            self.thissparsevanillaptr = self.thisptr = new CSparseLSTMBuilder()
+        self.cg_version = -1
+
+    @property
+    def spec(self): return self._spec
+
+    @classmethod
+    def from_spec(cls, spec, model):
+        layers, input_dim, hidden_dim, ln_lstm, forget_bias = spec
+        return SparseLSTMBuilder(layers, input_dim, hidden_dim, model, ln_lstm, forget_bias)
+
+# TODO rename to parameters()?
+    cpdef get_parameters(self):
+        """Retrieve the internal parameters of the VanillaLSTM
+        
+        The output is a list with one item per layer. Each item is a list containing :math:`W_x,W_h,b` where :math:`W_x,W_h` are stacked version of the individual gates matrices:
+
+        .. code-block:: text
+
+                  h/x   
+                +------+
+                |      |
+            i   |      |
+                +------+
+                |      |
+            f   |      |
+                +------+
+                |      |
+            o   |      |
+                +------+
+                |      |
+            c   |      |
+                +------+
+
+        Returns:
+            List of parameters for each layer
+            list
+        """
+        params = []
+        for l in self.thissparsevanillaptr.params:
+            layer_params=[]
+            for w in l:
+                layer_params.append(Parameters.wrap_ptr(w))
+            params.append(layer_params)
+        return params
+
+# TODO rename to parameter_expressions()?
+    cpdef get_parameter_expressions(self):
+        """Retrieve the internal parameters expressions of the VanillaLSTM
+        
+        The output is a list with one item per layer. Each item is a list containing :math:`W_x,W_h,b` where :math:`W_x,W_h` are stacked version of the individual gates matrices:
+
+        .. code-block:: text
+
+                  h/x   
+                +------+
+                |      |
+            i   |      |
+                +------+
+                |      |
+            f   |      |
+                +------+
+                |      |
+            o   |      |
+                +------+
+                |      |
+            c   |      |
+                +------+
+        
+        Returns:
+            List of parameter expressions for each layer
+            list
+
+        Raises:
+            ValueError: This raises an expression if initial_state hasn't been called because it requires thr parameters to be loaded in the computation graph. However it prevents the parameters to be loaded twice in the computation graph (compared to :code:`dynet.parameter(rnn.get_parameters()[0][0])` for example).
+        """
+        if self.thissparsevanillaptr.param_vars.size() == 0 or self.thissparsevanillaptr.param_vars[0][0].is_stale():
+            raise ValueError("Attempt to use a stale expression, renew CG and/or call initial_state before accessing VanillaLSTMBuilder internal parameters expression")
+
+        exprs = []
+        for l in self.thissparsevanillaptr.param_vars:
+            layer_exprs=[]
+            for w in l:
+                layer_exprs.append(Expression.from_cexpr(_cg.version(),w))
+            exprs.append(layer_exprs)
+        return exprs
+
+
+    cpdef void set_sparsity(self, float sparsity):
+        """Set the sparsity rate
+        
+        Args:
+            sparsity (number): The relative number of weights that will be pruned
+        """
+        self.thissparsevanillaptr.set_sparsity(sparsity)
 
     cpdef void set_dropouts(self, float d, float d_r):
         """Set the dropout rates
@@ -5380,7 +5618,7 @@ cdef class VanillaLSTMBuilder(_RNNBuilder): # {{{
             d (number): Dropout rate :math:`d_x` for the input :math:`x_t`
             d_r (number): Dropout rate :math:`d_x` for the output :math:`h_t`
         """
-        self.thisvanillaptr.set_dropout(d, d_r)
+        self.thissparsevanillaptr.set_dropout(d, d_r)
 
     cpdef void set_dropout_masks(self, unsigned batch_size=1):
         """Set dropout masks at the beginning of a sequence for a specific batch size
@@ -5392,10 +5630,10 @@ cdef class VanillaLSTMBuilder(_RNNBuilder): # {{{
         Args:
             batch_size (int): Batch size (default: {1})
         """
-        self.thisvanillaptr.set_dropout_masks(batch_size)
+        self.thissparsevanillaptr.set_dropout_masks(batch_size)
 
-    def whoami(self): return "VanillaLSTMBuilder"
-# VanillaLSTMBuilder }}}
+    def whoami(self): return "SparseLSTMBuilder"
+# SparseLSTMBuilder }}}
 
 
 # This is an alias for VanillaLSTMBuilder
@@ -6016,6 +6254,7 @@ cdef class Trainer:
     cpdef set_clip_threshold(self,float thr):
         """Set clipping thershold
         
+        Gradients are clipped to 5 by default.
         To deactivate clipping, set the threshold to be <=0
         
         Args:
